@@ -1,28 +1,27 @@
 /* Components used: trinket 5V, 3 shift registers (CD4094BE), clock module (TBD)
- *  
- *  Arduino IDE settings: 
- *  Register Adafruit boards manager url: https://adafruit.github.io/arduino-board-index/package_adafruit_index.json
- *  - board: adafruit pro trinket 5v/16MHz (USB)https://adafruit.github.io/arduino-board-index/package_adafruit_index.json
- *  - programmer = USBtinyISP
- */
+
+    Arduino IDE settings:
+    Register Adafruit boards manager url: https://adafruit.github.io/arduino-board-index/package_adafruit_index.json
+    - board: adafruit pro trinket 5v/16MHz (USB)https://adafruit.github.io/arduino-board-index/package_adafruit_index.json
+    - programmer = USBtinyISP
+*/
 
 #include <DS3231.h>
 #include <Wire.h>
 
-DS3231 my_clock;
-
-bool century = false;
-bool h12Flag;
-bool pmFlag;
-
 // shift registers
-int strobePin = 8;
-int dataPin = 6;
-int clockPin= 5;
+int strobe_pin = 8;
+int data_pin = 6;
+int clock_pin = 5;
 // output enable pin is connected to 5V (always on)
 
-// clockModule
-// clock uses i2c, can be connected to a battery to remember time on power outage, but is optional
+// clock variables
+// clock uses i2c, can be connected to a battery to remember time on power outage, but could be made optional
+DS3231 my_clock;
+bool century = false;
+bool h12_flag;
+bool pm_flag;
+
 
 // these are in dutch; There are 22 words, each word's address is made up of the register (0-2) and the bit offset (0 - 7)
 // HET IS TIJD MVIJF MTIEN KWART NA VOOR HALF EEN TWEE DRIE VIER VIJF ZES ZEVEN ACHT NEGEN TIEN ELF TWAALF UUR
@@ -51,135 +50,157 @@ int clockPin= 5;
 #define M_VIJF (1L<<22)
 #define TIEN (1L<<23)
 
-unsigned long hour[] = { TWAALF, EEN, TWEE, DRIE, VIER, VIJF, ZES, ZEVEN, ACHT, NEGEN, TIEN, ELF };
+unsigned long hour[] = { TWAALF, EEN, TWEE, DRIE, VIER, VIJF, ZES, ZEVEN, ACHT, NEGEN, TIEN, ELF, TWAALF };
 
 // button parameters
 int buttonPin = 12;
-#define LONG_PRESS_THRESHOLD 500
-int last_state = 0;
+#define LONG_PRESS_THRESHOLD 1000
+long last_button_state_change = 0;
+int last_state = HIGH;
 int long_press = 0;
-long state_change_time = 0;
+
+int mode = 0; // 0 = show time, 1 = set minute, 2 = set hour # TODO: flip 1 and 2, it's not as intuitive as I would like
+
+unsigned long lastBtnRead = 0;
+const long btnReadInterval = 20;
+
+unsigned long lastDisplayUpdate = 0;
+const long displayUpdateInterval = 100;
+
+int set_m = 0;
+int set_h = 0;
+int set_blink = 0; // during 'set time, we flash the current selected 5 minute increment; this is used to control the blinking
+int last_blink_toggle = 0;
+
+int hit = 0;
 
 void setup() {
-  pinMode(strobePin, OUTPUT);
-  pinMode(dataPin, OUTPUT);
-  pinMode(clockPin, OUTPUT);
+  pinMode(strobe_pin, OUTPUT);
+  pinMode(data_pin, OUTPUT);
+  pinMode(clock_pin, OUTPUT);
 
   pinMode(buttonPin, INPUT_PULLUP);
 
   // Start the I2C interface
   Wire.begin();
+  delay(500);
+  setTime(4, 55, 0);
+  showCurrentTime();
+  delay(500);
 }
 
-int mode = 0; // 0 = show time, 1 = set time
-long lastRefresh = 0;
-long lastHourIncrement = 0;
-
-int set_m = 0;
-int set_h = 0;
-int set_blink = 0; // during 'set time, we flash the current selected 5 minute increment; this is used to control the blinking
-
 void loop() {
-  if (millis() > state_change_time + 20) { // simple debounce
-    int btnRead = digitalRead(buttonPin);
-    if (btnRead == LOW && last_state == HIGH) {
-      // button down event, record start of press
-      long_press = 0;
-      state_change_time = millis();
-      if (mode == 1) {
-        set_m += 1;
-        if (set_m >= 60) {
-          set_m %= 60;
-          set_h += 1;
-          set_h %= 12;
-        }
-      }
-    } else if (btnRead == HIGH && last_state == LOW) {
-      // button up event    
-      state_change_time = millis();
-      if (mode == 0 && long_press == 1) {
-        mode = 1;
-        set_h = my_clock.getHour(h12Flag, pmFlag);
-        set_m = my_clock.getMinute();
-      }
-    } else if (btnRead == LOW) {
-      // handle sustained button down
-      if (millis() > state_change_time + LONG_PRESS_THRESHOLD) {
-        if (long_press == 0) {
-          // long press started
-//          long_press_start = state_change_time();
-          long_press = 1;
-          if (mode == 0) { // go to set-time mode
-            mode = 1;
-          }
-        }
-        
-        if (mode == 1) { // in set-time mode, each 500 ms, increment the our during a long press
-          if (millis() > lastHourIncrement + LONG_PRESS_THRESHOLD) {
-            set_h += 1;
-            set_h %= 12;
-            lastHourIncrement = millis();
-          }
-        }
-      }
-    }
-    last_state = btnRead;
-  }
-
+  handleInputs();
   updateDisplay();
 }
 
-void updateDisplay() {
-  if (mode == 0) {
-    writeLeds(TWAALF);
-  } else writeLeds(EEN);
-  return;
+void handleInputs() {
+  unsigned long currentTime = millis();
+  if (currentTime - lastBtnRead >= btnReadInterval) {
+    int btnRead = digitalRead(buttonPin);
+    handleButtonState(btnRead);
+
+    lastBtnRead = currentTime;
+  }
+}
+
+void handleButtonState(int btnRead) {
+  if (btnRead == LOW && last_state == HIGH) {
+    handleButtonDown();
+  } else if (btnRead == LOW && last_state == LOW) {
+    if ((!long_press) && (millis() - last_button_state_change > LONG_PRESS_THRESHOLD)) {
+      long_press = 1;
+      handleLongPress();
+    }
+  } else if (btnRead == HIGH && last_state == LOW) {
+    if (!long_press) {
+      handleButtonUp();
+    }
+  }
+  last_state = btnRead;
+}
+
+void handleButtonDown() {
+  long_press = 0;
+  last_button_state_change = millis();
+}
+
+void handleButtonUp() {
+  last_button_state_change = millis();
+  if (long_press == 0) {
+    handleShortPress();
+  } else {
+    // long press is handled as soon as it is detected, so nothing to do here
+  }
+}
+
+void handleShortPress() {
   if (mode == 1) {
-    // TODO: if button is untouched for 30 seconds, set the time to the marked time + 30 seconds + go to show-time mode
-    
-    if (millis() > lastRefresh + 300) {
-      if (set_blink == 0) {
-        showSetTime();
-      } else {
-        clearLeds();
-      }
-      set_blink = 1 - set_blink;
-      lastRefresh = millis();
-    }
-  } else {
-    // update the time every second
-    if (millis()  > lastRefresh + 1000) {      
-      showCurrentTime();
-      lastRefresh = millis();
-    }
-  }
-}
-
-void handle_short_press() {
-  if (mode == 1) { // we are in set-time mode, increment time by 1 minute;
     set_m += 1;
-    if (set_m >= 60) {
-      set_h += 1;
-      set_m %= 60;
-    }
-  } else {
-    // short press in show-time mode does nothing
+    set_m %= 60;
+  }
+  if (mode == 2) {
+    set_h += 1;
+    set_h %= 12;
   }
 }
 
-void show(unsigned long pattern) {
-  writeLeds(pattern);
+
+void handleLongPress() {
+  if (mode == 0) {
+    set_h = my_clock.getHour(h12_flag, pm_flag)%12;
+    set_m = my_clock.getMinute();
+  } else if (mode == 2) {
+    setTime(set_h, set_m, 0);
+  }
+  
+  mode += 1;
+  mode %= 3;
 }
 
-void showSetTime() {
-  writeLeds(get_time_bits(set_h, set_m));
+void setTime(int h, int m, int s) {
+  my_clock.setHour(h);
+  my_clock.setMinute(m);
+  my_clock.setSecond(s);
+}
+
+void updateDisplay() {
+  long currentTime = millis();
+  if (currentTime - lastDisplayUpdate >= displayUpdateInterval) {
+//          switch(mode) {
+//            case 0: show(EEN); break;
+//            case 1: show(TWEE); break;
+//            case 2: show(DRIE); break;
+//          }
+    if (mode == 0) showCurrentTime();
+    else if (mode == 1) showSetMinute();
+    else if (mode == 2) showSetHour();
+    lastDisplayUpdate = currentTime;
+  }
+}
+
+
+void showSetMinute() {
+  if (millis() > last_blink_toggle + 500) {
+    last_blink_toggle = millis();
+    set_blink = 1 - set_blink;
+  }
+  show((set_blink ? TIJD : 0) | minute_indication(set_m));
+}
+
+void showSetHour() {
+  if (millis() > last_blink_toggle + 500) {
+    last_blink_toggle = millis();
+    set_blink = 1 - set_blink;
+  }
+  show((set_blink ? minute_indication(set_m) : 0) | hour_indication(set_h, set_m));
 }
 
 void showCurrentTime() {
   unsigned long result = HET | IS;
 
-  int h = my_clock.getHour(h12Flag, pmFlag);
-  int m = my_clock.getMinute();
+  int h = my_clock.getHour(h12_flag, pm_flag) % 12;
+  int m = my_clock.getMinute() % 60;
   int s = my_clock.getSecond();
 
   // when reading the clock, always round to the nearest 5 minute increment
@@ -187,39 +208,71 @@ void showCurrentTime() {
   // add 2.5 minutes
   m += 2;
   s += 30;
-  if (s >= 30) { m += 1; }
-  if (m >= 60) { m %= 60; h += 1; }
-  
+  if (s >= 30) {
+    m += 1;
+  }
+  if (m >= 60) {
+    m %= 60;
+    h += 1;
+  }
+
   result |= get_time_bits(h, m);
 
   show(result);
 }
 
+void displayNumber(int n) {
+  while (n > 0) {
+    show(HET|IS | hour[n%10]);
+    delay(1000);
+    n /= 10;
+  }
+}
+
 unsigned long get_time_bits(int h, int m) {
-    // set the resulting time (add 1 hour if it's more than 15 after the hour - this is locale dependent, and works for dutch).
-  if (m >= 55) return M_VIJF | VOOR | hour[(h+1)%12];
-  if (m >= 50) return M_TIEN | VOOR | hour[(h+1)%12];
-  if (m >= 45) return KWART | VOOR | hour[(h+1)%12];
-  if (m >= 40) return M_TIEN | NA | HALF | hour[(h+1)%12];
-  if (m >= 35) return M_VIJF| NA | HALF | hour[(h+1)%12];
-  if (m >= 30) return HALF | hour[(h+1)%12];
-  if (m >= 25) return M_VIJF | VOOR | HALF | hour[(h+1)%12];
-  if (m >= 20) return M_TIEN | VOOR | HALF | hour[(h+1)%12];
-  if (m >= 15) return KWART | NA | hour[h%12];
-  if (m >= 10) return M_TIEN | NA| hour[h%12];
-  if (m >= 5) return M_VIJF | NA | hour[h%12];
-  return hour[h%12] | UUR;
+  // set the resulting time (add 1 hour if it's more than 15 after the hour - this is locale dependent, and works for dutch).
+  return minute_indication(m) | hour_indication(h, m);
+}
+
+unsigned long hour_indication(int h, int m) {
+  m -= m % 5;
+  if (m > 15) {
+    return hour[(h + 1) % 12];
+  }
+  return hour[h % 12];
+}
+
+unsigned long minute_indication(int m) {
+  m -= m % 5;
+  switch (m) {
+    case 0: return UUR;
+    case 5: return M_VIJF | NA;
+    case 10: return M_TIEN | NA;
+    case 15: return KWART | NA;
+    case 20: return M_TIEN | VOOR | HALF;
+    case 25: return M_VIJF | VOOR | HALF;
+    case 30: return HALF;
+    case 35: return M_VIJF | NA | HALF;
+    case 40: return M_TIEN | NA | HALF;
+    case 45: return KWART | VOOR;
+    case 50: return M_TIEN | VOOR;
+    case 55: return M_VIJF | VOOR;
+  }
+  return 0; // should not happen
 }
 
 void clearLeds() {
-  writeLeds(0L);
+  show(0L);
 }
 
-void writeLeds(unsigned long pattern) {
-  digitalWrite(strobePin, LOW);
+void show(unsigned long pattern) {
+  if (hit) {
+    pattern = hour[hit];
+  }
+  digitalWrite(strobe_pin, LOW);
   // note we're using inverse logic on the leds, so high = off
-  shiftOut(dataPin, clockPin, LSBFIRST, ~(pattern));
-  shiftOut(dataPin, clockPin, LSBFIRST, ~(pattern>>8));
-  shiftOut(dataPin, clockPin, LSBFIRST, ~(pattern>>16));
-  digitalWrite(strobePin, HIGH);
+  shiftOut(data_pin, clock_pin, LSBFIRST, ~(pattern));
+  shiftOut(data_pin, clock_pin, LSBFIRST, ~(pattern >> 8));
+  shiftOut(data_pin, clock_pin, LSBFIRST, ~(pattern >> 16));
+  digitalWrite(strobe_pin, HIGH);
 }
